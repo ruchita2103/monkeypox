@@ -1,0 +1,191 @@
+import os
+import zipfile
+import numpy as np
+import tensorflow as tf
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, f1_score
+from sklearn.utils.class_weight import compute_class_weight
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, Flatten, concatenate
+from tensorflow.keras.applications import ResNet50, VGG19, InceptionV3
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+
+# Configuration
+IMG_SIZE = (224, 224)
+BATCH_SIZE = 32
+EPOCHS = 1  # Use 1 or 2 epochs for your PC
+LEARNING_RATE = 0.0001
+ZIP_PATH = '/content/archive (19).zip'  # Path to the ZIP file
+EXTRACTED_PATH = '/content/monkeypox_dataset/'  # Extracted dataset path
+
+# Extract ZIP file
+if not os.path.exists(EXTRACTED_PATH):
+    with zipfile.ZipFile(ZIP_PATH, 'r') as zip_ref:
+        zip_ref.extractall(EXTRACTED_PATH)
+
+DATASET_PATH = os.path.join(EXTRACTED_PATH, 'Original Images')  # Adjust to the extracted folder
+
+# Data Augmentation
+data_gen = ImageDataGenerator(
+    rescale=1./255,
+    validation_split=0.2,
+    rotation_range=25,
+    width_shift_range=0.2,
+    height_shift_range=0.2,
+    shear_range=0.2,
+    zoom_range=0.2,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+train_gen = data_gen.flow_from_directory(
+    DATASET_PATH,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='binary',  # Use 'binary' for one class dataset
+    subset='training',
+    seed=42
+)
+
+val_gen = data_gen.flow_from_directory(
+    DATASET_PATH,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='binary',  # Use 'binary' for one class dataset
+    subset='validation',
+    seed=42
+)
+
+# Verify the number of classes
+num_classes = train_gen.num_classes
+if num_classes == 1:
+    print("Only one class detected. Proceeding with binary classification.")
+
+# Compute Class Weights
+class_weights = compute_class_weight(
+    class_weight='balanced',
+    classes=np.unique(train_gen.classes),
+    y=train_gen.classes
+)
+class_weights = {i: weight for i, weight in enumerate(class_weights)}
+
+# Base Models
+resnet_base = ResNet50(weights='imagenet', include_top=False, input_shape=(*IMG_SIZE, 3))
+vgg_base = VGG19(weights='imagenet', include_top=False, input_shape=(*IMG_SIZE, 3))
+inception_base = InceptionV3(weights='imagenet', include_top=False, input_shape=(*IMG_SIZE, 3))
+
+# Unfreeze Last Few Layers for Fine-Tuning
+for base_model in [resnet_base, vgg_base, inception_base]:
+    for layer in base_model.layers[-10:]:
+        layer.trainable = True
+
+# Custom Layers
+def create_branch(base_model):
+    x = base_model.output
+    x = Flatten()(x)
+    return x
+
+resnet_branch = create_branch(resnet_base)
+vgg_branch = create_branch(vgg_base)
+inception_branch = create_branch(inception_base)
+
+# Combine Branches
+combined = concatenate([resnet_branch, vgg_branch, inception_branch])
+x = Dense(512, activation='relu')(combined)
+x = Dropout(0.5)(x)
+
+# Output layer: For binary classification
+output = Dense(1, activation='sigmoid')(x)
+
+# Input Layer
+input_layer = Input(shape=(*IMG_SIZE, 3))
+
+# Model with shared input
+resnet_out = resnet_base(input_layer)
+vgg_out = vgg_base(input_layer)
+inception_out = inception_base(input_layer)
+
+resnet_branch = Flatten()(resnet_out)
+vgg_branch = Flatten()(vgg_out)
+inception_branch = Flatten()(inception_out)
+
+combined = concatenate([resnet_branch, vgg_branch, inception_branch])
+x = Dense(512, activation='relu')(combined)
+x = Dropout(0.5)(x)
+
+# Output layer: For binary classification
+output = Dense(1, activation='sigmoid')(x)
+
+model = Model(inputs=input_layer, outputs=output)
+model.compile(optimizer=Adam(learning_rate=LEARNING_RATE), loss='binary_crossentropy', metrics=['accuracy'])
+
+# Callbacks
+early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+lr_scheduler = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3)
+
+# Training
+history = model.fit(
+    train_gen,
+    epochs=EPOCHS,
+    validation_data=val_gen,
+    class_weight=class_weights,
+    callbacks=[early_stopping, lr_scheduler]
+)
+
+# Save Model
+model.save('MonkeypoxHybridNet.keras')
+
+# Evaluation
+eval_results = model.evaluate(val_gen)
+print(f"Validation Loss: {eval_results[0]}, Validation Accuracy: {eval_results[1]}\n")
+
+# Final Accuracy
+final_accuracy = eval_results[1] * 100
+print(f"Final Validation Accuracy: {final_accuracy:.2f}%")
+
+# Plot Training History
+plt.figure(figsize=(12, 6))
+plt.plot(history.history['accuracy'], label='Training Accuracy')
+plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+plt.title('Model Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.show()
+
+plt.figure(figsize=(12, 6))
+plt.plot(history.history['loss'], label='Training Loss')
+plt.plot(history.history['val_loss'], label='Validation Loss')
+plt.title('Model Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+# Generate Predictions
+y_pred = model.predict(val_gen)
+y_pred_classes = (y_pred > 0.5).astype("int32")  # Convert probabilities to binary output
+y_true = val_gen.classes
+
+# Confusion Matrix
+cm = confusion_matrix(y_true, y_pred_classes)
+plt.figure(figsize=(10, 8))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=val_gen.class_indices.keys(), yticklabels=val_gen.class_indices.keys())
+plt.title('Confusion Matrix')
+plt.xlabel('Predicted Labels')
+plt.ylabel('True Labels')
+plt.show()
+
+# Classification Report
+report = classification_report(y_true, y_pred_classes, target_names=val_gen.class_indices.keys(), output_dict=True)
+print("Classification Report:")
+print(classification_report(y_true, y_pred_classes, target_names=val_gen.class_indices.keys()))
+
+# Final Metrics
+accuracy = accuracy_score(y_true, y_pred_classes) * 100
+f1 = f1_score(y_true, y_pred_classes, average='weighted') * 100
+print(f"Final Accuracy: {accuracy:.2f}%")
+print(f"Final F1 Score: {f1:.2f}%")
